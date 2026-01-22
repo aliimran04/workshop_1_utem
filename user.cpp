@@ -13,12 +13,27 @@ void createUser(sql::Connection* con, const string& fullName, const string& emai
         unique_ptr<sql::PreparedStatement> pstmt(
             con->prepareStatement("INSERT INTO `user` (FullName, Email, Password, Role) VALUES (?, ?, ?, ?)")
         );
+
         pstmt->setString(1, fullName);
         pstmt->setString(2, email);
-        pstmt->setString(3, pwd); // TODO: Hash password
+
+        // Logic Change: Check if the role is Customer
+        if (role == "Customer" || role == "customer") {
+            pstmt->setString(3, "N/A"); // Default placeholder for customers
+        }
+        else {
+            pstmt->setString(3, pwd);   // Standard password for Admin/Staff
+        }
+
         pstmt->setString(4, role);
         pstmt->executeUpdate();
-        cout << "Registration Success\n";
+
+        if (role == "Customer") {
+            cout << "Registration Success (Customer: No password required)\n";
+        }
+        else {
+            cout << "Registration Success\n";
+        }
     }
     catch (const sql::SQLException& e) {
         if (e.getErrorCode() == 1062) {
@@ -33,41 +48,69 @@ void createUser(sql::Connection* con, const string& fullName, const string& emai
 
 void readUsers(sql::Connection* con) {
     try {
-        unique_ptr<sql::Statement> stmt(con->createStatement());
-        unique_ptr<sql::ResultSet> res(stmt->executeQuery("SELECT * FROM user"));
-        // Define column widths. Adjust these values based on your data length.
-        const int ID_W = 5;
-        const int NAME_W = 25;
-        const int EMAIL_W = 30;
-        const int ROLE_W = 10;
+        // Step 1: Get Total Count for Perspective
+        std::unique_ptr<sql::Statement> countStmt(con->createStatement());
+        std::unique_ptr<sql::ResultSet> countRes(countStmt->executeQuery("SELECT COUNT(*) FROM user"));
+        long long totalUsers = 0;
+        if (countRes->next()) totalUsers = countRes->getInt64(1);
+
+        // Step 2: Query for data
+        std::unique_ptr<sql::Statement> stmt(con->createStatement());
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery("SELECT UserID, FullName, Email, Role FROM user ORDER BY UserID ASC"));
+
+        const int ID_W = 8, NAME_W = 25, EMAIL_W = 35, ROLE_W = 12;
         const int TOTAL_WIDTH = ID_W + NAME_W + EMAIL_W + ROLE_W + 5;
-        // 1. Print the Header Row
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        std::cout << "| "
-            << std::left << std::setw(ID_W - 2) << "ID" << " | "
-            << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
-            << std::left << std::setw(EMAIL_W - 3) << "Email" << " | "
-            << std::left << std::setw(ROLE_W - 2) << "Role" << " |"
-            << std::endl;
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        // 2. Iterate through Results
+
+        int rowCount = 0;
+        int pageSize = 20;
+
+        auto printHeader = [&]() {
+            std::cout << "\nTotal Registered Users: " << totalUsers << "\n";
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            std::cout << "| " << std::left << std::setw(ID_W - 2) << "ID" << " | "
+                << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
+                << std::left << std::setw(EMAIL_W - 3) << "Email" << " | "
+                << std::left << std::setw(ROLE_W - 2) << "Role" << " |" << std::endl;
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            };
+
+        printHeader();
+
         while (res->next()) {
-            std::cout << "| "
-                // Get Int
-                << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
-                // Get Strings
+            std::cout << "| " << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
                 << std::left << std::setw(NAME_W - 3) << res->getString("FullName") << " | "
                 << std::left << std::setw(EMAIL_W - 3) << res->getString("Email") << " | "
-                << std::left << std::setw(ROLE_W - 2) << res->getString("Role") << " |"
-                << std::endl;
+                << std::left << std::setw(ROLE_W - 2) << res->getString("Role") << " |" << std::endl;
+
+            rowCount++;
+
+            // Pagination Trigger
+            if (rowCount % pageSize == 0) {
+                std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+                std::cout << ">>> Page " << (rowCount / pageSize) << " | " << rowCount << " of " << totalUsers << " displayed." << std::endl;
+                std::cout << ">>> [Enter] for more, [q] to stop, [c] to clear & continue: ";
+
+                std::string input;
+                std::getline(std::cin >> std::ws, input);
+
+                if (!input.empty() && std::tolower(input[0]) == 'q') return;
+
+                if (!input.empty() && std::tolower(input[0]) == 'c') {
+#ifdef _WIN32
+                    system("cls");
+#else
+                    system("clear");
+#endif
+                }
+                printHeader(); // Reprint headers for readability
+            }
         }
-        // 3. Print the Footer Separator
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+        std::cout << "End of User List.\n";
 
     }
-
     catch (sql::SQLException& e) {
-        cout << "Error retrieving users: " << e.what() << endl;
+        std::cout << "Error retrieving users: " << e.what() << std::endl;
     }
 }
 
@@ -156,54 +199,93 @@ void deleteUser(sql::Connection* con, int userID) {
     }
 }
 
+void viewUserDetails(sql::Connection* con, int userID) {
+    try {
+        unique_ptr<sql::PreparedStatement> pstmt(
+            con->prepareStatement("SELECT * FROM user WHERE UserID = ?")
+        );
+        pstmt->setInt(1, userID);
+        unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+
+        if (res->next()) {
+            cout << "\n========================================\n";
+            cout << "          USER PROFILE DETAILS          \n";
+            cout << "========================================\n";
+            cout << "User ID   : " << res->getInt("UserID") << endl;
+            cout << "Full Name : " << res->getString("FullName") << endl;
+            cout << "Email     : " << res->getString("Email") << endl;
+            cout << "Password  : [HIDDEN] " << endl; // Security best practice
+            cout << "Role      : " << res->getString("Role") << endl;
+
+            // If you have a CreatedAt column, you can display it too:
+            // cout << "Created   : " << res->getString("CreatedAt") << endl;
+
+            cout << "========================================\n";
+        }
+        else {
+            cout << "[Error] User ID " << userID << " not found.\n";
+        }
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error fetching user details: " << e.what() << endl;
+    }
+}
+
 
 
 
 void searchUser(sql::Connection* con, const std::string& name) {
     try {
+        // LIMIT 100 ensures the terminal doesn't crash if the search term is too broad
         std::unique_ptr<sql::PreparedStatement> pstmt(
-            con->prepareStatement("SELECT * FROM user WHERE FullName LIKE ?")
+            con->prepareStatement("SELECT UserID, FullName, Email, Role FROM user WHERE FullName LIKE ? LIMIT 100")
         );
         pstmt->setString(1, "%" + name + "%");
 
         std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
 
-        // Column widths
-        const int ID_W = 5;
-        const int NAME_W = 25;
-        const int EMAIL_W = 30;
-        const int ROLE_W = 10;
+        const int ID_W = 8, NAME_W = 25, EMAIL_W = 35, ROLE_W = 12;
         const int TOTAL_WIDTH = ID_W + NAME_W + EMAIL_W + ROLE_W + 5;
 
         bool found = false;
+        std::cout << "\n--- Search Results for '" << name << "' (Max 100) ---\n";
 
-        // Header
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        std::cout << "| "
-            << std::left << std::setw(ID_W - 2) << "ID" << " | "
-            << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
-            << std::left << std::setw(EMAIL_W - 3) << "Email" << " | "
-            << std::left << std::setw(ROLE_W - 2) << "Role" << " |"
-            << std::endl;
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-
-        // Rows
         while (res->next()) {
+            if (!found) { // Print header only if first result is found
+                std::cout << "| " << std::left << std::setw(ID_W - 2) << "ID" << " | "
+                    << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
+                    << std::left << std::setw(EMAIL_W - 3) << "Email" << " | "
+                    << std::left << std::setw(ROLE_W - 2) << "Role" << " |" << std::endl;
+                std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            }
             found = true;
-            std::cout << "| "
-                << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
+            std::cout << "| " << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
                 << std::left << std::setw(NAME_W - 3) << res->getString("FullName") << " | "
                 << std::left << std::setw(EMAIL_W - 3) << res->getString("Email") << " | "
-                << std::left << std::setw(ROLE_W - 2) << res->getString("Role") << " |"
-                << std::endl;
+                << std::left << std::setw(ROLE_W - 2) << res->getString("Role") << " |" << std::endl;
         }
-
-        // Footer
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
 
-        if (!found) {
-            std::cout << "User not found.\n";
+        if (!found) std::cout << "No users found matching that name.\n";
+
+        cout << "\nEnter User ID to view full profile (or 0 to return): ";
+        int targetID;
+        while (!(cin >> targetID)) {
+            cout << "Invalid input. Enter User ID (0 to return): ";
+            cin.clear();
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
         }
+        cin.ignore(numeric_limits<streamsize>::max(), '\n'); // Clean buffer
+
+        if (targetID != 0) {
+            viewUserDetails(con, targetID);
+
+            // Optional: Pause so they can read it
+            cout << "\nPress Enter to return to menu...";
+            cin.get();
+        }
+
     }
     catch (sql::SQLException& e) {
         std::cout << "Error searching user: " << e.what() << std::endl;

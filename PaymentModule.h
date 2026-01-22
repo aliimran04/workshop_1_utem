@@ -23,7 +23,8 @@ void searchPayment(sql::Connection* con);
 
 // Helper / Validation Functions
 bool checkPaymentExistsForJob(sql::Connection* con, int jobID);
-double getJobCostIfValid(sql::Connection* con, int jobID, int userID);
+double getJobCostIfValid(sql::Connection* con, int jobID);
 int readCustomers(sql::Connection* con);
 // Display / Utility Function
 void readAllPayments(sql::Connection* con);
+bool listUnpaidJobs(sql::Connection* con, int userID);

@@ -276,7 +276,7 @@ void createPrintJob(sql::Connection* con, int userID, int pageCount, double cost
     }
 }*/
 //test update print job with auto consumption
-void updatePrintJob(sql::Connection* con, int jobID, int newPageCount, double newCostPerPage) {
+/*void updatePrintJob(sql::Connection* con, int jobID, int newPageCount, double newCostPerPage) {
     try {
         // 1. Fetch the OLD PageCount to calculate the inventory difference
         int oldPageCount = 0;
@@ -370,6 +370,97 @@ void updatePrintJob(sql::Connection* con, int jobID, int newPageCount, double ne
     catch (sql::SQLException& e) {
         cerr << "Error updating print job and inventory: " << e.what() << endl;
     }
+}*/
+void updatePrintJob(sql::Connection* con, int jobID, int newPageCount, double newCostPerPage) {
+    try {
+        // 1. Fetch the OLD PageCount
+        int oldPageCount = 0;
+        unique_ptr<PreparedStatement> selectPstmt(
+            con->prepareStatement("SELECT PageCount FROM printjob WHERE JobID = ?")
+        );
+        selectPstmt->setInt(1, jobID);
+        unique_ptr<ResultSet> res(selectPstmt->executeQuery());
+
+        if (!res->next()) {
+            cout << "[Error] Job ID not found." << endl;
+            return;
+        }
+        oldPageCount = res->getInt("PageCount");
+
+        // 2. Inventory Logic (Only if pages changed)
+        int pageDiff = 0;
+        int inkDiff = 0;
+        if (newPageCount > 0 && newPageCount != oldPageCount) {
+            pageDiff = newPageCount - oldPageCount;
+            int oldInk = (oldPageCount + 99) / 100;
+            int newInk = (newPageCount + 99) / 100;
+            inkDiff = newInk - oldInk;
+
+            if (pageDiff > 0) {
+                if (!isInventorySufficient(con, pageDiff)) {
+                    cout << "[Error] Update failed: Insufficient inventory." << endl;
+                    return;
+                }
+            }
+        }
+
+        // 3. Build SQL (THE FIX IS HERE)
+        std::string sql = "UPDATE printjob SET ";
+        bool anyChange = false; // changed variable name from 'first' to 'anyChange' for clarity
+
+        if (newPageCount > 0) {
+            sql += "PageCount = ?";
+            anyChange = true;
+        }
+        if (newCostPerPage > 0.0) {
+            if (anyChange) sql += ", "; // Add comma if we already added PageCount
+            sql += "CostPerPage = ?";
+            anyChange = true;
+        }
+
+        // --- CRITICAL CHECK ---
+        // If the user skipped both inputs, stop here. Do not run SQL.
+        if (!anyChange) {
+            cout << "No changes requested. Update skipped." << endl;
+            return;
+        }
+
+        sql += " WHERE JobID = ?";
+
+        // 4. Execute Update
+        unique_ptr<PreparedStatement> pstmt(con->prepareStatement(sql));
+        int idx = 1;
+        if (newPageCount > 0) pstmt->setInt(idx++, newPageCount);
+        if (newCostPerPage > 0.0) pstmt->setDouble(idx++, newCostPerPage);
+        pstmt->setInt(idx++, jobID);
+        pstmt->executeUpdate();
+
+        // 5. Adjust Inventory (if needed)
+        if (pageDiff != 0) {
+            // Adjust Paper
+            unique_ptr<PreparedStatement> paperUpd(
+                con->prepareStatement("UPDATE inventory SET Quantity = Quantity - ? WHERE ItemType = 'Paper'")
+            );
+            paperUpd->setInt(1, pageDiff);
+            paperUpd->executeUpdate();
+
+            // Adjust Ink
+            if (inkDiff != 0) {
+                unique_ptr<PreparedStatement> inkUpd(
+                    con->prepareStatement("UPDATE inventory SET Quantity = Quantity - ? WHERE ItemType = 'Ink'")
+                );
+                inkUpd->setInt(1, inkDiff);
+                inkUpd->executeUpdate();
+            }
+            cout << "[Success] Inventory adjusted." << endl;
+        }
+
+        cout << "[Success] Print Job updated successfully!" << endl;
+
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error updating print job: " << e.what() << endl;
+    }
 }
 
 
@@ -423,49 +514,56 @@ void searchPrintJob(sql::Connection* con, int jobID) {
 // readCustomers and readPrintJobs definitions assumed to be here.
 // In your printjob.cpp or PrintJobManager.cpp file:
 //read list of customer role user in the database
-int readCustomers(sql::Connection* con) { // <-- Return type is now int
-
-    int customerCount = 0; // Initialize counter
+int readCustomers(sql::Connection* con) {
+    int customerCount = 0;
     try {
+        // Get Total Count first
+        customerCount = countCustomerUsers(con);
+
         std::unique_ptr<sql::PreparedStatement> pstmt(
-            con->prepareStatement("SELECT UserID, FullName, Email FROM user WHERE Role = 'Customer'")
+            con->prepareStatement("SELECT UserID, FullName, Email FROM user WHERE Role = 'Customer' ORDER BY UserID ASC")
         );
         std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
 
-        // Define column widths
-        const int ID_W = 5;
-        const int NAME_W = 25;
-        const int EMAIL_W = 30;
+        const int ID_W = 10, NAME_W = 25, EMAIL_W = 35;
         const int TOTAL_WIDTH = ID_W + NAME_W + EMAIL_W + 4;
 
-        std::cout << "\n--- Available Customer Users ---\n";
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        std::cout << "| "
-            << std::left << std::setw(ID_W - 2) << "User ID" << " | "
-            << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
-            << std::left << std::setw(EMAIL_W - 3) << "Email" << " |"
-            << std::endl;
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+        int displayed = 0;
+        int pageSize = 15; // Small batch so the menu stays visible
 
-        // Iterate through results and count them
+        auto printHeader = [&]() {
+            std::cout << "\n--- Available Customers (" << customerCount << " total) ---\n";
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            std::cout << "| " << std::left << std::setw(ID_W - 2) << "User ID" << " | "
+                << std::left << std::setw(NAME_W - 3) << "FullName" << " | "
+                << std::left << std::setw(EMAIL_W - 3) << "Email" << " |" << std::endl;
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            };
+
+        printHeader();
+
         while (res->next()) {
-            customerCount++; // Increment counter
-            std::cout << "| "
-                << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
+            displayed++;
+            std::cout << "| " << std::left << std::setw(ID_W - 2) << res->getInt("UserID") << " | "
                 << std::left << std::setw(NAME_W - 3) << res->getString("FullName") << " | "
-                << std::left << std::setw(EMAIL_W - 3) << res->getString("Email") << " |"
-                << std::endl;
+                << std::left << std::setw(EMAIL_W - 3) << res->getString("Email") << " |" << std::endl;
+
+            if (displayed % pageSize == 0 && displayed < customerCount) {
+                std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+                std::cout << ">>> [" << displayed << "/" << customerCount << "] Enter for more, 's' to skip to menu: ";
+                std::string input;
+                std::getline(std::cin >> std::ws, input);
+                if (!input.empty() && std::tolower(input[0]) == 's') break;
+                printHeader();
+            }
         }
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
 
-        if (customerCount == 0) {
-            std::cout << " No users with the 'Customer' role found.\n";
-        }
     }
     catch (sql::SQLException& e) {
-        std::cerr << "Error retrieving customers: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
     }
-    return customerCount; // Return the final count
+    return customerCount;
 }
 
 int countCustomerUsers(sql::Connection* con) {
@@ -491,62 +589,68 @@ int countCustomerUsers(sql::Connection* con) {
 
 void readPrintJobs(sql::Connection* con) {
     try {
-        std::unique_ptr<sql::Statement> stmt(con->createStatement());
+        // 1. Get total job count
+        std::unique_ptr<sql::Statement> stmtCount(con->createStatement());
+        std::unique_ptr<sql::ResultSet> resCount(stmtCount->executeQuery("SELECT COUNT(*) FROM printjob"));
+        long long totalJobs = 0;
+        if (resCount->next()) totalJobs = resCount->getInt64(1);
 
-        // MODIFIED SQL QUERY: Selects UserID (p.UserID) AND FullName (u.FullName)
+        // 2. Query data
+        std::unique_ptr<sql::Statement> stmt(con->createStatement());
         std::unique_ptr<sql::ResultSet> res(stmt->executeQuery(
             "SELECT p.JobID, p.UserID, u.FullName, p.PageCount, p.JobCost "
-            "FROM printjob p "
-            "JOIN user u ON p.UserID = u.UserID "
+            "FROM printjob p JOIN user u ON p.UserID = u.UserID "
             "ORDER BY p.JobID DESC"
         ));
 
-        // Define column widths for the new merged view
-        const int JOB_ID_W = 6;
-        const int USER_ID_W = 7;     // Added back
-        const int NAME_W = 20;       // Adjusted size for FullName
-        const int PAGE_W = 12;
-        const int COST_W = 10;
+        const int JOB_ID_W = 10, USER_ID_W = 10, NAME_W = 25, PAGE_W = 12, COST_W = 12;
         const int TOTAL_WIDTH = JOB_ID_W + USER_ID_W + NAME_W + PAGE_W + COST_W + 6;
 
-        std::cout << "\n--- All Existing Print Jobs (Detailed View) ---\n";
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        std::cout << "| "
-            << std::left << std::setw(JOB_ID_W - 2) << "Job ID" << " | "
-            << std::left << std::setw(USER_ID_W - 2) << "User ID" << " | " // Display User ID header
-            << std::left << std::setw(NAME_W - 2) << "Customer Name" << " | "
-            << std::left << std::setw(PAGE_W - 2) << "Page Count" << " | "
-            << std::left << std::setw(COST_W - 2) << "Cost ($)" << " |"
-            << std::endl;
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+        int displayed = 0;
+        int pageSize = 20;
 
-        bool found = false;
+        auto printHeader = [&]() {
+            std::cout << "\n--- Job History (" << totalJobs << " records) ---\n";
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            std::cout << "| " << std::left << std::setw(JOB_ID_W - 2) << "Job ID" << " | "
+                << std::left << std::setw(USER_ID_W - 2) << "User ID" << " | "
+                << std::left << std::setw(NAME_W - 2) << "Customer" << " | "
+                << std::left << std::setw(PAGE_W - 2) << "Pages" << " | "
+                << std::left << std::setw(COST_W - 2) << "Cost ($)" << " |" << std::endl;
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            };
+
+        printHeader();
+
         while (res->next()) {
-            found = true;
-            std::cout << "| "
-                << std::left << std::setw(JOB_ID_W - 2) << res->getInt("JobID") << " | "
-                << std::left << std::setw(USER_ID_W - 2) << res->getInt("UserID") << " | " // Display User ID value
+            displayed++;
+            std::cout << "| " << std::left << std::setw(JOB_ID_W - 2) << res->getInt("JobID") << " | "
+                << std::left << std::setw(USER_ID_W - 2) << res->getInt("UserID") << " | "
                 << std::left << std::setw(NAME_W - 2) << res->getString("FullName") << " | "
                 << std::left << std::setw(PAGE_W - 2) << res->getInt("PageCount") << " | "
-                << std::left << std::setw(COST_W - 2) << std::fixed << std::setprecision(2) << res->getDouble("JobCost") << " |"
-                << std::endl;
+                << std::left << std::setw(COST_W - 2) << std::fixed << std::setprecision(2) << res->getDouble("JobCost") << " |" << std::endl;
+
+            if (displayed % pageSize == 0 && displayed < totalJobs) {
+                std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+                std::cout << ">>> [" << displayed << "/" << totalJobs << "] Enter for more, 's' to stop: ";
+                std::string input;
+                std::getline(std::cin >> std::ws, input);
+                if (!input.empty() && std::tolower(input[0]) == 's') break;
+                printHeader();
+            }
         }
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
 
-        if (!found) {
-            std::cout << "No print jobs found in the system.\n";
-            PrintJobManagementMenu(con);
-        }
     }
     catch (sql::SQLException& e) {
-        std::cerr << "Error retrieving print jobs: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
     }
 }
 
 
 // --- Main Menu Function (PrintJobManagementMenu) ---
 
-void PrintJobManagementMenu(sql::Connection* con) {
+/*void PrintJobManagementMenu(sql::Connection* con) {
     int choice = 0;
 
     // FIX: Remove initial calls outside the loop
@@ -697,5 +801,341 @@ void PrintJobManagementMenu(sql::Connection* con) {
         // Wait for user before looping back (A)
         cout << "\nPress Enter to return to Print Job Menu...\n";
         cin.get();
+    }
+} */
+// Helper 1: Search for users by name and display them
+bool searchUsersByName(sql::Connection* con, string nameInput) {
+    try {
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement("SELECT UserID, FullName, Email FROM user WHERE FullName LIKE ? AND Role = 'Customer'")
+        );
+        pstmt->setString(1, "%" + nameInput + "%");
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (!res->isBeforeFirst()) { // Check if result set is empty
+            cout << "No users found matching \"" << nameInput << "\"." << endl;
+            return false;
+        }
+
+        cout << "\n--- Search Results for \"" << nameInput << "\" ---\n";
+        cout << left << setw(10) << "UserID" << setw(25) << "Full Name" << setw(30) << "Email" << endl;
+        cout << "----------------------------------------------------------------" << endl;
+
+        while (res->next()) {
+            cout << left << setw(10) << res->getInt("UserID")
+                << setw(25) << res->getString("FullName")
+                << setw(30) << res->getString("Email") << endl;
+        }
+        cout << "----------------------------------------------------------------" << endl;
+        return true;
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error searching users: " << e.what() << endl;
+        return false;
+    }
+}
+
+// Helper 2: List all jobs for a specific UserID
+bool listJobsForUser(sql::Connection* con, int userID) {
+    try {
+        // We still fetch the data, ordered by newest first
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement("SELECT JobID, PageCount, TimeStamp, JobCost FROM printjob WHERE UserID = ? ORDER BY TimeStamp DESC")
+        );
+        pstmt->setInt(1, userID);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (!res->isBeforeFirst()) {
+            cout << "No print jobs found for User ID: " << userID << endl;
+            return false;
+        }
+
+        cout << "\n--- Job History for User ID " << userID << " ---\n";
+        cout << left << setw(10) << "JobID" << setw(15) << "Pages" << setw(12) << "Cost" << setw(25) << "Date/Time" << endl;
+        cout << "--------------------------------------------------------------" << endl;
+
+        int rowCount = 0;
+        int pageSize = 10; // Adjust this number to change how many show at once
+
+        while (res->next()) {
+            cout << left << setw(10) << res->getInt("JobID")
+                << setw(15) << res->getInt("PageCount")
+                << "$" << setw(11) << fixed << setprecision(2) << res->getDouble("JobCost")
+                << setw(25) << res->getString("TimeStamp") << endl;
+
+            rowCount++;
+
+            // --- Pagination Logic ---
+            // If we have shown 'pageSize' rows, pause the loop
+            if (rowCount % pageSize == 0) {
+                cout << "--------------------------------------------------------------" << endl;
+                cout << ">>> Showing " << rowCount << " jobs. Found your Job ID?" << endl;
+                cout << ">>> Press [Enter] for older jobs, or type 's' to stop listing: ";
+
+                string input;
+                getline(cin, input);
+
+                if (!input.empty() && tolower(input[0]) == 's') {
+                    // User found what they wanted, break the display loop
+                    cout << ">>> Listing stopped." << endl;
+                    break;
+                }
+
+                // If they pressed Enter, reprint the header for clarity
+                cout << "\n--- Page " << (rowCount / pageSize) + 1 << " ---\n";
+                cout << left << setw(10) << "JobID" << setw(15) << "Pages" << setw(12) << "Cost" << setw(25) << "Date/Time" << endl;
+                cout << "--------------------------------------------------------------" << endl;
+            }
+        }
+        cout << "--------------------------------------------------------------" << endl;
+        return true;
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error listing jobs: " << e.what() << endl;
+        return false;
+    }
+}
+
+void PrintJobManagementMenu(sql::Connection* con) {
+    while (true) {
+#ifdef _WIN32
+        system("cls");
+#else
+        system("clear");
+#endif
+
+        int availableCustomers = countCustomerUsers(con);
+
+        cout << "\n=== Print Job Management (Total Customers: " << availableCustomers << ") ===\n";
+        cout << "1. Create New Print Job\n";
+        cout << "2. Update Print Job Info\n";
+        cout << "3. Delete Print Job Info\n";
+        cout << "4. Search Print Job Info\n";
+        cout << "5. Exit\n";
+        cout << "================================================\n";
+
+        int choice = readInt("Enter choice: ");
+        // Ensure buffer is clean before the next possible getline
+        std::cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+       /* switch (choice) {
+        case 1:
+            if (availableCustomers > 0) {
+                // Option: Let user search for customer ID by name first
+                while (!searchIDsByCustomerName(con));
+                int userID = readInt("Enter User ID to assign job: ");
+                int pageCount = readInt("Enter Page Count: ");
+                cin.ignore(numeric_limits<streamsize>::max(), '\n');
+                if (isInventorySufficient(con, pageCount)) {
+                    createPrintJob(con, userID, pageCount, 0.50);
+                }
+            }
+            break;
+
+        case 2: { // Update
+            // 1. Loop search until a valid name is found
+            while (!searchIDsByCustomerName(con));
+
+            // 2. Capture the specific Job ID from the displayed list
+            int jobID = readInt("Enter Job ID from the list above to update: ");
+
+            // 3. Capture the new data
+            int newPages = readInt("New Page Count (0 to skip): ");
+
+            // 4. Pass the variables to the update function
+            updatePrintJob(con, jobID, newPages, 0.0);
+
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 3: {// Delete
+            // 1. Force search until a valid customer name is found
+            while (!searchIDsByCustomerName(con));
+
+            // 2. Prompt for the specific Job ID identified in the search results
+            int jobIDToDelete = readInt("Enter Job ID to Delete: ");
+
+            // 3. Perform the deletion using the captured ID
+            deletePrintJob(con, jobIDToDelete);
+
+            // 4. Clear the buffer to ensure the next menu loop works correctly
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 4: { // Search Detailed Info
+            // This now serves as a "Global Search" by name
+            while (!searchIDsByCustomerName(con));
+            // If you still want the specific individual search:
+            searchPrintJob(con, readInt("Enter Job ID for details: "));
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 5:
+            return;
+        }*/
+        std::string nameSearch;
+        bool foundAny = false;
+
+        switch (choice) {
+        case 1: { // Create Job
+            if (availableCustomers > 0) {
+                foundAny = false;
+                while (true) {
+                    std::cout << "Enter Customer Name to find ID (or '0' to exit): ";
+                    if (std::cin.peek() == '\n') std::cin.ignore();
+                    std::getline(std::cin, nameSearch);
+
+                    if (nameSearch == "0") break; // Return to Print Job menu
+
+                    if (searchIDsByCustomerName(con, nameSearch)) {
+                        foundAny = true;
+                        break;
+                    }
+                }
+
+                if (foundAny) {
+                    int userID = readInt("Enter User ID to assign job: ");
+                    int pageCount = readInt("Enter Page Count: ");
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                    if (isInventorySufficient(con, pageCount)) {
+                        createPrintJob(con, userID, pageCount, 0.50);
+                    }
+                }
+            }
+            break;
+        }
+
+        case 2: { // Update Job
+            //foundAny = false;
+            while (true) {
+                std::cout << "Enter Customer Name to find Job IDs (or '0' to exit): ";
+                if (std::cin.peek() == '\n') std::cin.ignore();
+                std::getline(std::cin, nameSearch);
+
+                if (nameSearch == "0") break;
+
+               /* if (searchIDsByCustomerName(con, nameSearch)) {
+                    foundAny = true;
+                    break;
+                }*/
+                if (searchUsersByName(con, nameSearch)) {
+
+                    // Step 3: Select User ID
+                    int selectedUserID = readInt("Enter UserID from list above to view jobs: ");
+
+                    // Step 4: Show Jobs for that User
+                    if (listJobsForUser(con, selectedUserID)) {
+
+                        // Step 5: Select specific Job ID for full details
+                        int jobID = readInt("Enter Job ID from the list above to update: ");
+                        int newPages = readInt("New Page Count (0 to skip): ");
+                        updatePrintJob(con, jobID, newPages, 0.0);
+                    }
+                }
+            }
+
+            /*if (foundAny) {
+                int jobID = readInt("Enter Job ID from the list above to update: ");
+                int newPages = readInt("New Page Count (0 to skip): ");
+                updatePrintJob(con, jobID, newPages, 0.0);
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            }*/
+            // Step 2: Show matching Users
+            
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            cout << "Press Enter to return to menu...";
+            cin.get();
+            goto ExitCase2;
+            ExitCase2:
+            break;
+        }
+
+        case 3: { // Delete Job
+            //foundAny = false;
+            while (true) {
+                std::cout << "Enter Customer Name to find Job IDs (or '0' to exit): ";
+                if (std::cin.peek() == '\n') std::cin.ignore();
+                std::getline(std::cin, nameSearch);
+
+                if (nameSearch == "0") break;
+                if (searchUsersByName(con, nameSearch)) {
+
+                    // Step 3: Select User ID
+                    int selectedUserID = readInt("Enter UserID from list above to view jobs: ");
+
+                    // Step 4: Show Jobs for that User
+                    if (listJobsForUser(con, selectedUserID)) {
+
+                        // Step 5: Select specific Job ID for full details
+                        int jobIDToDelete = readInt("Enter Job ID to Delete: ");
+                        deletePrintJob(con, jobIDToDelete);
+                    }
+                }
+
+                /*if (searchIDsByCustomerName(con, nameSearch)) {
+                    foundAny = true;
+                    break;
+                }*/
+            }
+
+            //if (foundAny) {
+               // int jobIDToDelete = readInt("Enter Job ID to Delete: ");
+               // deletePrintJob(con, jobIDToDelete);
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            //}
+            break;
+        }
+
+        /*case 4: { // Search Detailed Info
+            std::cout << "Enter Customer Name to search (or '0' to exit): ";
+            if (std::cin.peek() == '\n') std::cin.ignore();
+            std::getline(std::cin, nameSearch);
+
+            if (nameSearch != "0") {
+                if (searchIDsByCustomerName(con, nameSearch)) {
+                    searchPrintJob(con, readInt("Enter Job ID for details: "));
+                }
+            }
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            break;
+        }*/
+        case 4: { // Search Print Job Info
+
+            // Step 1: Get Name
+            string nameSearch;
+            cout << "Enter Customer Name to search (or '0' to exit): ";
+            // Handle buffer from previous cin
+            if (cin.peek() == '\n') cin.ignore();
+            getline(cin, nameSearch);
+
+            if (nameSearch == "0") break;
+
+            // Step 2: Show matching Users
+            if (searchUsersByName(con, nameSearch)) {
+
+                // Step 3: Select User ID
+                int selectedUserID = readInt("Enter UserID from list above to view jobs: ");
+
+                // Step 4: Show Jobs for that User
+                if (listJobsForUser(con, selectedUserID)) {
+
+                    // Step 5: Select specific Job ID for full details
+                    int selectedJobID = readInt("Enter JobID for full details: ");
+                    searchPrintJob(con, selectedJobID); // Calls your existing detail function
+                }
+            }
+        
+
+            // Clean up buffer before breaking to menu
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+
+        case 5:
+            return;
+        }
+
+        std::cout << "\nOperation Complete. Press Enter to return to menu...";
+        std::cin.get(); // This is the pause that saves your search results!
     }
 }

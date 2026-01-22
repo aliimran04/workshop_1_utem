@@ -69,69 +69,268 @@ bool checkUserIDExists(sql::Connection* con, int uid) {
 
 
 }
+// Helper 1: Search for users by name (Identical logic, reused for Payment context)
+bool searchUsersByName1(sql::Connection* con, string nameInput) {
+    try {
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement("SELECT UserID, FullName, Email FROM user WHERE FullName LIKE ? AND Role = 'Customer'")
+        );
+        pstmt->setString(1, "%" + nameInput + "%");
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (!res->isBeforeFirst()) {
+            cout << "No users found matching \"" << nameInput << "\"." << endl;
+            return false;
+        }
+
+        cout << "\n--- Search Results for \"" << nameInput << "\" ---\n";
+        cout << left << setw(10) << "UserID" << setw(25) << "Full Name" << setw(30) << "Email" << endl;
+        cout << "----------------------------------------------------------------" << endl;
+
+        while (res->next()) {
+            cout << left << setw(10) << res->getInt("UserID")
+                << setw(25) << res->getString("FullName")
+                << setw(30) << res->getString("Email") << endl;
+        }
+        cout << "----------------------------------------------------------------" << endl;
+        return true;
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error searching users: " << e.what() << endl;
+        return false;
+    }
+}
+
+// Helper 2: List all PAYMENTS for a specific UserID (With Pagination)
+bool listPaymentsForUser(sql::Connection* con, int userID) {
+    try {
+        // Query the PAYMENT table
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement("SELECT TransactionID, Amount, Method, PaymentStatus, TimeStamp FROM payment WHERE UserID = ? ORDER BY TimeStamp DESC")
+        );
+        pstmt->setInt(1, userID);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (!res->isBeforeFirst()) {
+            cout << "No payment history found for User ID: " << userID << endl;
+            return false;
+        }
+
+        cout << "\n--- Payment History for User ID " << userID << " ---\n";
+        // Adjusted column headers for Payment data
+        cout << left << setw(10) << "TransID" << setw(12) << "Amount" << setw(10) << "Method" << setw(15) << "Status" << setw(25) << "Date/Time" << endl;
+        cout << "----------------------------------------------------------------------------" << endl;
+
+        int rowCount = 0;
+        int pageSize = 10;
+
+        while (res->next()) {
+            cout << left << setw(10) << res->getInt("TransactionID")
+                << "$" << setw(11) << fixed << setprecision(2) << res->getDouble("Amount")
+                << setw(10) << res->getString("Method")
+                << setw(15) << res->getString("PaymentStatus")
+                << setw(25) << res->getString("TimeStamp") << endl;
+
+            rowCount++;
+
+            // --- Pagination Logic ---
+            if (rowCount % pageSize == 0) {
+                cout << "----------------------------------------------------------------------------" << endl;
+                cout << ">>> Showing " << rowCount << " payments. Found your Transaction ID?" << endl;
+                cout << ">>> Press [Enter] for older payments, or type 's' to stop listing: ";
+
+                string input;
+                getline(cin, input);
+
+                if (!input.empty() && tolower(input[0]) == 's') {
+                    cout << ">>> Listing stopped." << endl;
+                    break;
+                }
+
+                cout << "\n--- Page " << (rowCount / pageSize) + 1 << " ---\n";
+                cout << left << setw(10) << "TransID" << setw(12) << "Amount" << setw(10) << "Method" << setw(15) << "Status" << setw(25) << "Date/Time" << endl;
+                cout << "----------------------------------------------------------------------------" << endl;
+            }
+        }
+        cout << "----------------------------------------------------------------------------" << endl;
+        return true;
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error listing payments: " << e.what() << endl;
+        return false;
+    }
+}
+// Add this helper function above your CreatePayment function
+bool listUnpaidJobs(sql::Connection* con, int userID) {
+    try {
+        // Query: Find jobs for this user that are NOT in the payment table (or not 'Complete')
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement(
+                "SELECT JobID, PageCount, JobCost, TimeStamp "
+                "FROM printjob "
+                "WHERE UserID = ? "
+                "AND JobID NOT IN (SELECT JobID FROM payment WHERE PaymentStatus = 'Complete') "
+                "ORDER BY JobID DESC"
+            )
+        );
+        pstmt->setInt(1, userID);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        // Check if list is empty
+        if (!res->isBeforeFirst()) {
+            cout << "\n[Info] No unpaid print jobs found for User ID " << userID << ".\n";
+            return false;
+        }
+
+        cout << "\n--- Unpaid Jobs for User " << userID << " ---\n";
+        cout << left << setw(10) << "JobID" << setw(10) << "Pages" << setw(12) << "Cost ($)" << setw(25) << "Date" << endl;
+        cout << "--------------------------------------------------------\n";
+
+        while (res->next()) {
+            cout << left << setw(10) << res->getInt("JobID")
+                << setw(10) << res->getInt("PageCount")
+                << fixed << setprecision(2) << setw(12) << res->getDouble("JobCost")
+                << setw(25) << res->getString("TimeStamp") << endl;
+        }
+        cout << "--------------------------------------------------------\n";
+        return true;
+    }
+    catch (sql::SQLException& e) {
+        cerr << "Error listing unpaid jobs: " << e.what() << endl;
+        return false;
+    }
+}
+
 
 // PaymentModule.cpp
 
-// ... existing code ...
+void createPayment(sql::Connection* con) {
+    cout << "\n--- Create New Payment ---\n";
+
+    int uid = readInt("Enter User ID (UID): ");
+    if (!checkUserIDExists(con, uid)) {
+        cout << "[Error] User ID " << uid << " does not exist.\n";
+        return;
+    }
+    else {
+        (!listUnpaidJobs( con, uid));
+    };
+    
+
+    int jid = readInt("Enter Job ID (JID): ");
+    if (checkPaymentExistsForJob(con, jid)) {
+        cout << "[Error] A payment record already exists for Job ID " << jid << ".\n";
+        return;
+    }
+
+    double jobCost = getJobCostIfValid(con, jid, uid);
+    if (jobCost < 0) {
+        cout << "[Error] Invalid Job ID or Job does not belong to User " << uid << ".\n";
+        return;
+    }
+
+    cout << "Total Job Cost: $" << fixed << setprecision(2) << jobCost << endl;
+    double amount = 0;
+    cout << "Enter Payment Amount: ";
+    cin >> amount;
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+    string method;
+    cout << "Enter Payment Method (e.g., Cash, Card): ";
+    getline(cin, method);
+    double balance = amount - jobCost;
+    std::cout << ">>> Payment Accepted. Change Due: $" << fixed << setprecision(2) << balance << endl;
+    // Business Logic: Determine status based on cost
+    string status = (amount >= jobCost) ? "Complete" : "Insufficient";
+
+    try {
+        unique_ptr<PreparedStatement> pstmt(
+            con->prepareStatement("INSERT INTO payment (UserID, JobID, Amount, Method, PaymentStatus) VALUES (?, ?, ?, ?, ?)")
+        );
+        pstmt->setInt(1, uid);
+        pstmt->setInt(2, jid);
+        pstmt->setDouble(3, amount);
+        pstmt->setString(4, method);
+        pstmt->setString(5, status);
+
+        pstmt->executeUpdate();
+        cout << "[Success] Payment recorded. Status: " << status << "\n";
+    }
+    catch (SQLException& e) {
+        cerr << "SQL Error (Insert Payment): " << e.what() << endl;
+    }
+}
 
 void readAllPayments(sql::Connection* con) {
     try {
-        std::unique_ptr<sql::Statement> stmt(con->createStatement());
+        // 1. Get 64-bit Total Count for the header
+        std::unique_ptr<sql::Statement> countStmt(con->createStatement());
+        std::unique_ptr<sql::ResultSet> countRes(countStmt->executeQuery("SELECT COUNT(*) FROM payment"));
+        long long totalPayments = 0;
+        if (countRes->next()) totalPayments = countRes->getInt64(1);
 
-        // SQL Query: Joins payment (p) and user (u) tables on UserID
-        // This query fetches all necessary details for display.
+        // 2. Stream all results (Most recent first)
+        std::unique_ptr<sql::Statement> stmt(con->createStatement());
         std::unique_ptr<sql::ResultSet> res(stmt->executeQuery(
             "SELECT p.TransactionID, p.JobID, p.Amount, p.Method, p.TimeStamp, p.PaymentStatus, "
-            "u.UserID, u.FullName, u.Email "
-            "FROM payment p "
-            "JOIN user u ON p.UserID = u.UserID "
+            "u.UserID, u.FullName "
+            "FROM payment p JOIN user u ON p.UserID = u.UserID "
             "ORDER BY p.TimeStamp DESC"
         ));
 
-        // Define column widths for the display table
-        const int TRANS_ID_W = 6;
-        const int USER_ID_W = 7;
-        const int NAME_W = 20;
-        const int JOB_ID_W = 6;
-        const int AMOUNT_W = 10;
-        const int PaymentStatus_W = 12;
-        const int DATE_W = 20;
-        const int TOTAL_WIDTH = TRANS_ID_W + USER_ID_W + NAME_W + JOB_ID_W + AMOUNT_W + PaymentStatus_W + DATE_W + 8;
+        const int TRANS_ID_W = 8, USER_ID_W = 8, NAME_W = 22, JOB_ID_W = 8, AMOUNT_W = 12, STATUS_W = 14, DATE_W = 12;
+        const int TOTAL_WIDTH = TRANS_ID_W + USER_ID_W + NAME_W + JOB_ID_W + AMOUNT_W + STATUS_W + DATE_W + 8;
 
-        std::cout << "\n--- All Payment Transactions and User Details ---\n";
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
-        std::cout << "| "
-            << std::left << std::setw(TRANS_ID_W - 2) << "TID" << " | "
-            << std::left << std::setw(USER_ID_W - 2) << "U ID" << " | "
-            << std::left << std::setw(NAME_W - 2) << "Customer Name" << " | "
-            << std::left << std::setw(JOB_ID_W - 2) << "J ID" << " | "
-            << std::left << std::setw(AMOUNT_W - 2) << "Amount" << " | "
-            << std::left << std::setw(PaymentStatus_W - 2) << "PaymentStatus" << " | "
-            << std::left << std::setw(DATE_W - 2) << "Date" << " |"
-            << std::endl;
-        std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+        int rowCount = 0;
+        int pageSize = 20;
 
-        bool found = false;
+        auto printHeader = [&]() {
+            std::cout << "\n--- All Payments (" << totalPayments << " records) ---\n";
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            std::cout << "| " << left << setw(TRANS_ID_W - 2) << "TID" << "| " << setw(USER_ID_W - 2) << "UID"
+                << "| " << setw(NAME_W - 2) << "Customer" << "| " << setw(JOB_ID_W - 2) << "JID"
+                << "| " << setw(AMOUNT_W - 2) << "Amount" << "| " << setw(STATUS_W - 2) << "Status"
+                << "| " << setw(DATE_W - 2) << "Date" << " |" << endl;
+            std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+            };
+
+        printHeader();
+
         while (res->next()) {
-            found = true;
-            std::cout << "| "
-                << std::left << std::setw(TRANS_ID_W - 2) << res->getInt("TransactionID") << " | "
-                << std::left << std::setw(USER_ID_W - 2) << res->getInt("UserID") << " | "
-                << std::left << std::setw(NAME_W - 2) << res->getString("FullName") << " | "
-                << std::left << std::setw(JOB_ID_W - 2) << res->getInt("JobID") << " | "
-                << std::left << std::setw(AMOUNT_W - 2) << std::fixed << std::setprecision(2) << res->getDouble("Amount") << " | "
-                << std::left << std::setw(PaymentStatus_W - 2) << res->getString("PaymentStatus") << " | "
-                << std::left << std::setw(DATE_W - 2) << res->getString("TimeStamp") << " |"
-                << std::endl;
+            std::cout << "| " << left << setw(TRANS_ID_W - 2) << res->getInt("TransactionID")
+                << "| " << setw(USER_ID_W - 2) << res->getInt("UserID")
+                << "| " << setw(NAME_W - 2) << res->getString("FullName").substr(0, 18)
+                << "| " << setw(JOB_ID_W - 2) << res->getInt("JobID")
+                << "| $" << setw(AMOUNT_W - 3) << fixed << setprecision(2) << res->getDouble("Amount")
+                << "| " << setw(STATUS_W - 2) << res->getString("PaymentStatus")
+                << "| " << res->getString("TimeStamp").substr(0, 10) << " |" << endl;
+
+            rowCount++;
+
+            // Pagination Trigger
+            if (rowCount % pageSize == 0 && rowCount < totalPayments) {
+                std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
+                std::cout << ">>> [" << rowCount << "/" << totalPayments << "] [Enter] more, 'c' clear, 's' stop: ";
+
+                std::string input;
+                std::getline(std::cin, input); // No 'ws' here so Enter alone works
+
+                if (!input.empty() && std::tolower(input[0]) == 's') break;
+                if (!input.empty() && std::tolower(input[0]) == 'c') {
+#ifdef _WIN32
+                    system("cls");
+#else
+                    system("clear");
+#endif
+                }
+                printHeader();
+            }
         }
         std::cout << "+" << std::string(TOTAL_WIDTH - 2, '-') << "+" << std::endl;
 
-        if (!found) {
-            std::cout << "No payment transactions found in the system.\n";
-        }
     }
     catch (sql::SQLException& e) {
-        std::cerr << "Error retrieving all payments: " << e.what() << std::endl;
+        std::cerr << "SQL Error: " << e.what() << std::endl;
     }
 }
 
@@ -139,97 +338,11 @@ void readAllPayments(sql::Connection* con) {
 // CORE MODULE LOGIC
 // ==========================================
 
-void createPayment(sql::Connection* con) {
-    cout << "\n--- Create New Payment ---\n";
-    readPrintJobs(con);
 
-    // 1. Get UID
-    int uid = readInt("Enter User ID: ");
-
-    // Check if User exists
-    if (!checkUserIDExists(con, uid)) {
-        cout << "[Error] User Not Exist.\n";
-        return;
-    }
-
-    // 2. Get JobID
-    int jobId = readInt("Enter Job ID: ");
-
-    // 3. Validate Job Ownership and Get Cost
-    double jobCost = getJobCostIfValid(con, jobId, uid);
-    if (jobCost < 0) {
-        cout << "[Error] Job Not Exist (or does not belong to this UID).\n";
-        return;
-    }
-
-    // 4. Check for duplicate payment
-    if (checkPaymentExistsForJob(con, jobId)) {
-        cout << "[Error] Payment already exists for this Job (No partial payments).\n";
-        return;
-    }
-
-    // 5. Get Payment Details
-    double amount;
-    cout << "Job Cost is: $" << fixed << setprecision(2) << jobCost << endl;
-    cout << "Enter Payment Amount: ";
-    while (!(cin >> amount)) {
-        cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout << "Invalid amount. Try again: ";
-    }
-    cin.ignore(numeric_limits<streamsize>::max(), '\n');
-
-    string method;
-    cout << "Enter Method (e.g., Cash, Card): ";
-    getline(cin, method);
-
-    // Note: Database usually handles TimeStamp via DEFAULT CURRENT_TIMESTAMP, 
-    // but we can allow manual entry if required by requirements, or skip to use DB time.
-    // For this code, we will let the DB handle the timestamp to ensure consistency.
-
-    // 6. Determine PaymentStatus
-    string PaymentStatus = (amount >= jobCost) ? "Complete" : "Insufficient";
-    // 6.1 Determine Status and Calculate Balance/Change
-    string status = (amount >= jobCost) ? "Complete" : "Insufficient";
-    double balance = amount - jobCost; // Balance/Change calculation
-
-    // 7. Insert Record
-    try {
-        unique_ptr<PreparedStatement> pstmt(
-            con->prepareStatement(
-                "INSERT INTO payment (UserID, JobID, Amount, Method, PaymentStatus, TimeStamp) VALUES (?, ?, ?, ?, ?, NOW())"
-            )
-        );
-        pstmt->setInt(1, uid);
-        pstmt->setInt(2, jobId);
-        pstmt->setDouble(3, amount);
-        pstmt->setString(4, method);
-        pstmt->setString(5, PaymentStatus);
-
-        pstmt->executeUpdate();
-
-        // Get the generated TransactionID
-        unique_ptr<Statement> stmt(con->createStatement());
-        unique_ptr<ResultSet> res(stmt->executeQuery("SELECT LAST_INSERT_ID() AS id"));
-        if (res->next()) {
-            cout << "[Success] Payment recorded (" << PaymentStatus << "). Transaction ID: " << res->getInt("id") << "\n";
-        }
-        // --- ADDED BALANCE DISPLAY LOGIC ---
-        if (status == "Complete" && balance > 0.00) {
-            cout << "---------------------------------------\n";
-            cout << "Amount paid: $" << fixed << setprecision(2) << amount << endl;
-            cout << "Job cost:    $" << fixed << setprecision(2) << jobCost << endl;
-            cout << "Balance/Change due to customer: $" << fixed << setprecision(2) << balance << endl;
-            cout << "---------------------------------------\n";
-        }
-    }
-    catch (SQLException& e) {
-        cerr << "[Error] SQL Error: " << e.what() << endl;
-    }
-}
 
 void updatePayment(sql::Connection* con) {
     cout << "\n--- Update Payment ---\n";
-    readAllPayments(con);
+    //readAllPayments(con);
     int transID = readInt("Enter TransactionID: ");
 
     try {
@@ -323,7 +436,7 @@ void updatePayment(sql::Connection* con) {
 
 void deletePayment(sql::Connection* con) {
     cout << "\n--- Delete Payment ---\n";
-    readAllPayments(con);
+    //readAllPayments(con);
     int transID = readInt("Enter TransactionID: ");
 
     try {
@@ -347,7 +460,7 @@ void deletePayment(sql::Connection* con) {
 
 void searchPayment(sql::Connection* con) {
     cout << "\n--- Search Payment ---\n";
-    readAllPayments(con);
+    //readAllPayments(con);
     int transID = readInt("Enter TransactionID: ");
 
     try {
@@ -384,8 +497,14 @@ void searchPayment(sql::Connection* con) {
 void runPaymentModule(sql::Connection* con) {
     int choice;
     do {
+#ifdef _WIN32
+        system("cls");
+#else
+        system("clear");
+#endif
+
         cout << "\n=====================================\n";
-        cout << "   Payment Management Module\n";
+        cout << "    Payment Management Module\n";
         cout << "=====================================\n";
         cout << "1. Create New Payment\n";
         cout << "2. Update Payment Transaction Info\n";
@@ -394,15 +513,207 @@ void runPaymentModule(sql::Connection* con) {
         cout << "5. Return to Main Menu\n";
 
         choice = readInt("Enter your choice (1-5): ");
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
-        switch (choice) {
-        case 1: createPayment(con); break;
-        case 2: updatePayment(con); break;
-        case 3: deletePayment(con); break;
-        case 4: searchPayment(con); break;
-        case 5: cout << "Exiting Payment Module...\n"; break;
-        default: cout << "[Error] Invalid option\n"; break;
+        /*switch (choice) {
+        case 1: {
+            // Loop until a customer with jobs is found
+            while (!searchIDsByCustomerName(con));
+            createPayment(con);
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 2: {
+            // Search helps find the Transaction ID for updates
+            while (!searchIDsByCustomerName(con));
+            updatePayment(con);
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 3: {
+            // Search helps verify the correct TID before deletion
+            while (!searchIDsByCustomerName(con));
+            deletePayment(con);
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 4: {
+            // Simple search to view status
+            searchIDsByCustomerName(con);
+            searchPayment(con);
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+        case 5:
+            cout << "Exiting Payment Module...\n";
+            return;
+
+        default:
+            cout << "[Error] Invalid option\n";
+            break;
         }
 
+        cout << "\nOperation Complete. Press Enter to continue...";
+        cin.get();
+
     } while (choice != 5);
-}
+}*/
+        std::string nameSearch;
+        switch (choice) {
+        case 1: { // Create Payment
+            clearScreen();
+            while (true) {
+                std::cout << "Enter Customer Name to find Job IDs (or '0' to exit): ";
+                if (std::cin.peek() == '\n') std::cin.ignore();
+                std::getline(std::cin, nameSearch);
+
+                if (nameSearch == "0") break;
+
+                /*if (searchIDsByCustomerName(con, nameSearch)) {
+                    createPayment(con);
+                    break;
+                }*/
+                // 1. Find the User
+                if (searchUsersByName1(con, nameSearch)) {
+                    createPayment(con);
+
+                    // 2. Select the User ID
+                   //int selectedUserID = readInt("Enter UserID from list above to view payments: ");
+
+                    // 3. List Payments for that User
+                    /*if (listPaymentsForUser(con, selectedUserID)) {
+
+                        // 4. Select specific Transaction ID (Drill down complete)
+                        // Assuming you have a detailed search function like searchPaymentDetails(con, id)
+                        //int transID = readInt("Enter Transaction ID for full details: ");
+                        
+                    }*/
+                }
+            }
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+            break;
+        } // End Case 1
+
+        case 2: { // Update Payment
+            clearScreen();
+            while (true) {
+                std::cout << "Enter Customer Name to find Transaction IDs (or '0' to exit): ";
+                if (std::cin.peek() == '\n') std::cin.ignore();
+                std::getline(std::cin, nameSearch);
+
+                if (nameSearch == "0") break;
+
+                /*if (searchIDsByCustomerName(con, nameSearch)) {
+                    updatePayment(con);
+                    break;
+                }*/
+                if (searchUsersByName1(con, nameSearch)) {
+
+                    // 2. Select the User ID
+                    int selectedUserID = readInt("Enter UserID from list above to view payments: ");
+
+                    // 3. List Payments for that User
+                    if (listPaymentsForUser(con, selectedUserID)) {
+
+                        // 4. Select specific Transaction ID (Drill down complete)
+                        // Assuming you have a detailed search function like searchPaymentDetails(con, id)
+                        //int transID = readInt("Enter Transaction ID for full details: ");
+                        updatePayment(con);
+                    }
+                }
+            }
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        } // End Case 2
+
+        case 3: { // Delete Payment
+            clearScreen();
+            while (true) {
+                std::cout << "Enter Customer Name to find Transaction IDs (or '0' to exit): ";
+                if (std::cin.peek() == '\n') std::cin.ignore();
+                std::getline(std::cin, nameSearch);
+
+                if (nameSearch == "0") break;
+
+                /*if (searchIDsByCustomerName(con, nameSearch)) {
+                    deletePayment(con);
+                    break;
+                }*/
+                if (searchUsersByName1(con, nameSearch)) {
+
+                    // 2. Select the User ID
+                    int selectedUserID = readInt("Enter UserID from list above to view payments: ");
+
+                    // 3. List Payments for that User
+                    if (listPaymentsForUser(con, selectedUserID)) {
+
+                        // 4. Select specific Transaction ID (Drill down complete)
+                        // Assuming you have a detailed search function like searchPaymentDetails(con, id)
+                        //int transID = readInt("Enter Transaction ID for full details: ");
+                        deletePayment(con);
+                    }
+                }
+            }
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        } // End Case 3
+
+        /*case 4: { // Search/View
+           //clearScreen();
+            std::cout << "Enter Customer Name to search (or '0' to exit): ";
+            if (std::cin.peek() == '\n') std::cin.ignore();
+            std::getline(std::cin, nameSearch);
+
+            if (nameSearch != "0") {
+                if (searchIDsByCustomerName(con, nameSearch)) {
+                    searchPayment(con);
+                }
+            }
+            break;
+        } // End Case 4*/
+        case 4: { // Search Payment Info
+            string nameSearch;
+            cout << "Enter Customer Name to search (or '0' to exit): ";
+            if (cin.peek() == '\n') cin.ignore();
+            getline(cin, nameSearch);
+
+            if (nameSearch == "0") break;
+
+            // 1. Find the User
+            if (searchUsersByName1(con, nameSearch)) {
+
+                // 2. Select the User ID
+                int selectedUserID = readInt("Enter UserID from list above to view payments: ");
+
+                // 3. List Payments for that User
+                if (listPaymentsForUser(con, selectedUserID)) {
+
+                    // 4. Select specific Transaction ID (Drill down complete)
+                    // Assuming you have a detailed search function like searchPaymentDetails(con, id)
+                    //int transID = readInt("Enter Transaction ID for full details: ");
+                    searchPayment(con);
+                }
+            }
+
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            break;
+        }
+
+        case 5:
+            cout << "Exiting Payment Module...\n";
+            return; // Direct return exits the function and loop
+
+        default:
+            cout << "[Error] Invalid option\n";
+            break;
+        } // End switch
+
+        if (choice != 5) {
+            cout << "\nOperation Complete. Press Enter to continue...";
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cin.get();
+        }
+
+    } while (choice != 5); // End do-while
+} // End function body

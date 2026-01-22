@@ -35,3 +35,4 @@ int countCustomerUsers(sql::Connection* con);
 int readCustomers(sql::Connection* con);
 // Function to display all available print jobs
 void readPrintJobs(sql::Connection* con);
+bool listJobsForUser(sql::Connection* con, int userID);
